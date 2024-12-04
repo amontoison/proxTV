@@ -212,8 +212,10 @@ int PN_LPinf(double *y,double lambda,double *x,double *info,int n,Workspace *ws)
         - ws: workspace of allocated memory to use. If NULL, any needed memory is locally managed.
         - positive: 1 if all inputs y >= 0, 0 else.
         - objGap: desired quality of the solution in terms of duality gap.
+        - ctx_ptr: pointer to context data to be passed to the callback function.
+        - callback: callback function to be called at each iteration.
 */
-int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspace *ws,int positive,double objGap){
+int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspace *ws,int positive,double objGap, void* ctx_ptr, int (*callback)(const double* s_ptr, size_t s_length, double delta_k, void* ctx_ptr)){
     double *g=NULL,*d=NULL,*xnorm=NULL,*auxv=NULL;
     double stop,stop2,q,nx,f,fupdate,aux,c,den,xp1vGrad,gRd,delta,prevDelta,improve,rhs,grad0,gap,epsilon;
     int *inactive=NULL,*signs=NULL;
@@ -246,6 +248,10 @@ int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspa
 
     /* Compute dual norm q */
     q = 1/(1-1/p);
+
+    /* initialize stopping condition */
+    bool stopping_condition = false;
+
 
     /* Special case where the solution is the trivial x = 0 */
     /* This is bound to happen if ||y||_q <= lambda */
@@ -295,7 +301,6 @@ int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspa
         auxv[i] = x[i] - y[i];
     nx = LPnorm( x, n, p );
     stop = PN_LPpGap(x, y, auxv, n, q, lambda, nx); // Compute gap of this solution in terms of TV-Lp norm
-
 
     // ADDED NOV 15 - BEGINNING OF COMMENTING LINES
 
@@ -372,7 +377,6 @@ int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspa
     for ( i = 0 ; i < n ; i++ )
         if ( x[i] < epsilon )
             x[i] = epsilon;
-
     /* Initial value of the point norm */
     nx = LPnorm(x,n,p);
     /* Compute differences x - y */
@@ -381,7 +385,7 @@ int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspa
 
     /* Projected Newton loop */
     stop = gap = DBL_MAX; iters = 0;
-    for(iters=0 ; stop > STOP_PNLP && iters < MAX_ITERS_PNLP && gap > objGap ; iters++){
+    for(iters=0 ;iters < MAX_ITERS_PNLP && !stopping_condition; iters++){ //  stop > STOP_PNLP && 
         #ifdef DEBUG
             fprintf(DEBUG_FILE,"Iter %d, x=[ ",iters);
             for(i=0;i<n && i<DEBUG_N;i++) fprintf(DEBUG_FILE,"%g ",x[i]);
@@ -465,15 +469,24 @@ int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspa
                 break;
 
             /* Use minimum norm subgradient updating direction */
-            case PNLP_MNSG:
+            case PNLP_MNSG: {
                 /* Compute minimum norm subgradient at x=0 */
                 /* Since the gradient at x=0 is not to be trusted, the inactive constraint detection is ignored */
                 nI = n;
+                double MAX_D = 1e9;
                 for(i=0;i<n;i++){
                     d[i] = - pow(y[i] / lambda, 1 / (p-1));
+
+                    if (isinf(d[i])) {
+                        d[i] = (d[i] > 0) ? MAX_D : -MAX_D;
+                    } else if (fabs(d[i]) > MAX_D) {
+                        d[i] = (d[i] > 0) ? MAX_D : -MAX_D;
+                    }
                     inactive[i] = i;
                 }
                 break;
+            }
+
 
             /* Hessian (Newton) updating direction */
             case PNLP_HESSIAN:
@@ -498,6 +511,7 @@ int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspa
                     /* 1./(1+c * xnorm./x) .* xnorm · g */
                     xp1vGrad += auxv[j] * g[j];
                 }
+
 
                 #ifdef DEBUG
                     fprintf(DEBUG_FILE,"Iter %d, dDiag=[ ",iters);
@@ -676,6 +690,35 @@ int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspa
 
         /* Compute dual gap */
         gap = PN_LPpGap(x, y, auxv, n, q, lambda, nx);
+
+        /* ADDED NOV 26 NATHAN ALLAIRE */
+        /* If callback and ctx_ptr are not defined, switch to regular update on dual gap. Else, call the callback function from Julia */
+        if (callback && ctx_ptr) {
+            double *x_signed = (double*)malloc(sizeof(double) * n);
+
+            /* Copy x into x_signed and adjust almost zero entries */
+            for (i = 0; i < n; i++) {
+                x_signed[i] = x[i];  // Copy the value from x
+                if (fabs(x_signed[i]) <= epsilon) {
+                    x_signed[i] = 0;  // Set near-zero values to exact zero
+                }
+            }
+
+            /* Apply signs if input was not all positive */
+            if (!positive) {
+                for (i = 0; i < n; i++) {
+                    x_signed[i] = (signs[i] == -1) ? -x_signed[i] : x_signed[i];
+                }
+            }
+
+            stopping_condition = callback(x_signed, n, gap, ctx_ptr);
+            free(x_signed);
+        } else {
+            stopping_condition = (gap < objGap);
+        } /* END OF NOV 26 ADDITION */
+
+        
+
         #ifdef DEBUG
             fprintf(DEBUG_FILE,"Iter %d, stop=%lg, gap=%lg\n",iters,stop,gap);
         #endif
@@ -747,7 +790,7 @@ int PN_LPp(double *y,double lambda,double *x,double *info,int n,double p,Workspa
     The proximity problem is solved to a default level of accuracy, as given by STOP_GAP_PNLP.
 */
 int PN_LPp_v2(double *y,double lambda,double *x,double *info,int n,double p,Workspace *ws,int positive) {
-    return PN_LPp(y, lambda, x, info, n, p, ws, positive, STOP_GAP_PNLP);
+    return PN_LPp(y, lambda, x, info, n, p, ws, positive, STOP_GAP_PNLP, NULL, NULL);
 }
 
 /** PN_LPpGap
